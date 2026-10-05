@@ -21,6 +21,14 @@ demo/run.sh --pace 5   # 5 seconds between steps
 demo/run.sh --ci       # no pauses; checks each step's outcome and exits non-zero if one differs (CI runs this)
 ```
 
+With `--broker <url>` (combinable with the above), steps 3 and 6 go through a Pact Broker instead of
+the local files: the consumer `janus publish`es its contract from a feature branch, the provider its
+shape and verification result from `main`, and the consumer asks `janus check --broker ... --main-branch`.
+The broker is the Rust Pact Broker ([pact_broker-rs](https://github.com/YOU54F/pact_broker-rs)), built
+with its `janus` feature and run with `PACT_BROKER_ENABLE_JANUS=true`; it judges the pair with the
+same engine, so the answers match the local ones. Each run publishes under versions of its own, so
+one broker serves many runs.
+
 It needs cargo, and Node 22.6 or later with npm. It builds `janus`, `janus-engine` and the sample
 provider, installs the web app's one dependency (Vitest) if it is missing, and starts
 `order-service` on a free port. It works on a scratch copy of the web app and applies each step's

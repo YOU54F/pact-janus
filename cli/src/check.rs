@@ -21,9 +21,10 @@
 //! implemented twice is a policy rule that will eventually disagree with itself.
 
 use crate::args::{Args, Spec};
+use crate::broker::{Broker, encode};
 use crate::engine;
 use crate::io;
-use serde_json::json;
+use serde_json::{Value, json};
 use std::process::ExitCode;
 
 pub const SPEC: Spec = Spec {
@@ -34,12 +35,20 @@ pub const SPEC: Spec = Spec {
     "on-finding",
     "on-review",
     "as-of",
+    "broker",
+    "pacticipant",
+    "version",
+    "branch",
+    "environment",
+    "to",
   ],
-  flags: &["json"],
+  flags: &["json", "main-branch"],
 };
 
 pub const USAGE: &str = "\
 usage: janus check <contract-or-pact>... [options]
+       janus check --broker <url> --pacticipant <name> (--version <v> | --branch <name>)
+                   (--environment <name> | --to <tag> | --main-branch) [--as-of <date>] [--json]
 
   <contract-or-pact>...      consumer contracts or v1-v4 pacts, or directories of them
   --provider-shape <path>    a provider shape document, or a directory of them; repeatable
@@ -55,9 +64,18 @@ on-review both default to warn (ADR 0016), because a check nobody can adopt catc
 
 This command reads documents and decides; it never contacts the provider. Verify first
 (`janus verify ... --json > result.json`), then pass that result here: a pair with no
-verification result is reported as unverified, which is not a pass.";
+verification result is reported as unverified, which is not a pass.
+
+With --broker the documents are the ones `janus publish` put there, and the broker decides:
+its matrix (has each pact been verified?) and, with its Janus module on, this same engine over
+the shape each provider version published. Exit 1 means its answer was no or unknown. The
+broker applies its own policy, so --policy, --on-finding and --on-review do not apply.
+Credentials come from PACT_BROKER_TOKEN, or PACT_BROKER_USERNAME and PACT_BROKER_PASSWORD.";
 
 pub fn run(args: &Args) -> ExitCode {
+  if let Some(base) = args.value("broker") {
+    return run_against_broker(args, base);
+  }
   let paths = args.positionals();
   if paths.is_empty() {
     return io::usage("check", "missing <contract-or-pact>", USAGE);
@@ -198,6 +216,145 @@ pub fn run(args: &Args) -> ExitCode {
     Some("block") => ExitCode::from(io::SUBJECT_FAILED),
     _ => ExitCode::SUCCESS,
   }
+}
+
+/// `check --broker`: asks the broker's `GET /decisions` the question `check` answers locally.
+///
+/// The broker forms the pairs from what was published — which pact each provider version
+/// verified, which shape it published — and asks the engine about each, so nothing here calls
+/// the engine: this host's half of the answer is only the question and the page.
+fn run_against_broker(args: &Args, base: &str) -> ExitCode {
+  if !args.positionals().is_empty() {
+    return io::usage(
+      "check",
+      "--broker reads published documents: name none on the command line",
+      USAGE,
+    );
+  }
+  if [
+    "provider-shape",
+    "verification",
+    "policy",
+    "on-finding",
+    "on-review",
+  ]
+  .iter()
+  .any(|option| args.value(option).is_some())
+  {
+    return io::usage(
+      "check",
+      "--broker decides with the broker's documents and policy: drop the local options",
+      USAGE,
+    );
+  }
+  let Some(pacticipant) = args.value("pacticipant") else {
+    return io::usage("check", "--broker needs --pacticipant", USAGE);
+  };
+  let mut query = vec![("pacticipant", pacticipant.to_string())];
+  match (args.value("version"), args.value("branch")) {
+    (Some(version), None) => query.push(("version", version.to_string())),
+    (None, Some(branch)) => query.push(("branch", branch.to_string())),
+    _ => return io::usage("check", "--broker needs one of --version or --branch", USAGE),
+  }
+  let targets: Vec<(&str, String)> = [
+    args.value("environment").map(|e| ("environment", e.to_string())),
+    args.value("to").map(|t| ("to", t.to_string())),
+    args
+      .flag("main-branch")
+      .then(|| ("mainBranch", "true".to_string())),
+  ]
+  .into_iter()
+  .flatten()
+  .collect();
+  if targets.len() != 1 {
+    return io::usage(
+      "check",
+      "--broker needs one of --environment, --to or --main-branch",
+      USAGE,
+    );
+  }
+  query.extend(targets);
+  if let Some(as_of) = args.value("as-of") {
+    query.push(("asOf", as_of.to_string()));
+  }
+  let query: Vec<String> = query
+    .iter()
+    .map(|(key, value)| format!("{key}={}", encode(value)))
+    .collect();
+
+  let decision = match Broker::new(base).get(&format!("/decisions?{}", query.join("&"))) {
+    Ok(decision) => decision,
+    Err(err) => return io::fail(&format!("janus check: {err}")),
+  };
+  if args.flag("json") {
+    println!("{}", serde_json::to_string_pretty(&decision).unwrap_or_default());
+  } else {
+    println!("{}", render_decision(&decision));
+  }
+  match decision["answer"].as_str() {
+    Some("yes") => ExitCode::SUCCESS,
+    _ => ExitCode::from(io::SUBJECT_FAILED),
+  }
+}
+
+/// A `/decisions` answer as prose: the answer, then each relationship it rests on, with the
+/// engine's own page for each relationship it judged.
+fn render_decision(decision: &Value) -> String {
+  let text = |value: &Value| value.as_str().unwrap_or_default().to_string();
+  let target = &decision["target"];
+  let against = if let Some(environment) = target["environment"].as_str() {
+    format!("be deployed to {environment}")
+  } else if let Some(tag) = target["tag"].as_str() {
+    format!("be deployed alongside the versions tagged {tag}")
+  } else {
+    "be merged into the main branch".to_string()
+  };
+  let mut lines = vec![format!(
+    "Can {} {} {against}? {} (decided by {})",
+    text(&decision["pacticipant"]),
+    text(&decision["version"]["number"]),
+    text(&decision["answer"]).to_uppercase(),
+    text(&decision["decidedBy"]),
+  )];
+  if let Some(reason) = decision["reason"].as_str() {
+    lines.push(format!("  {reason}"));
+  }
+  for relationship in decision["relationships"].as_array().into_iter().flatten() {
+    let party = |side: &str| {
+      let party = &relationship[side];
+      match party["version"].as_str() {
+        Some(version) => format!("{} {version}", text(&party["name"])),
+        None => format!("{} (no version)", text(&party["name"])),
+      }
+    };
+    let ignored = if relationship["ignored"] == json!(true) {
+      " (ignored)"
+    } else {
+      ""
+    };
+    lines.push(String::new());
+    lines.push(format!(
+      "{} -> {}: {} {}{ignored}",
+      party("consumer"),
+      party("provider"),
+      text(&relationship["kind"]),
+      text(&relationship["verdict"]),
+    ));
+    let subsumption = &relationship["subsumption"];
+    if let Some(error) = subsumption["error"].as_str() {
+      lines.push(format!("  subsumption could not be checked: {error}"));
+    } else if subsumption["shapePublished"] == json!(false) {
+      lines.push("  no provider shape published for this provider version".to_string());
+    } else if let Some(page) = subsumption["text"].as_str() {
+      lines.extend(page.lines().map(|line| format!("  {line}")));
+    }
+  }
+  for notice in decision["notices"].as_array().into_iter().flatten() {
+    if notice["type"] == "warning" || notice["type"] == "danger" {
+      lines.push(format!("{}: {}", text(&notice["type"]), text(&notice["text"])));
+    }
+  }
+  lines.join("\n")
 }
 
 /// Today, UTC, as `YYYY-MM-DD` — the date exemption expiry is judged against when `--as-of` says

@@ -1917,6 +1917,7 @@ dependencies = [
 name = "pact_janus_cli"
 version = "0.0.0"
 dependencies = [
+ "base64 0.22.1",
  "pact_janus_component_host",
  "pact_janus_component_http",
  "pact_janus_component_json",
@@ -1930,6 +1931,7 @@ dependencies = [
  "tiny_http",
  "tracing",
  "tracing-subscriber",
+ "ureq",
 ]
 
 [[package]]

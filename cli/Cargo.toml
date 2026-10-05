@@ -39,6 +39,11 @@ serde_yaml_ng = "0.10"
 # so `RUST_LOG=trace` shows the frames `Engine::dispatch` traces on every call.
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# The Pact Broker client behind `janus publish` and `janus check --broker`: the same blocking HTTP
+# client the hooks host and the OAuth2 component use, and the encoder for basic auth's
+# credentials — both already in the tree.
+ureq = "3"
+base64 = "0.22"
 
 [dev-dependencies]
 # A real provider on a real socket for the CLI's own tests: `janus verify` is only worth testing
