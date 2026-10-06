@@ -48,7 +48,8 @@ pub const SPEC: Spec = Spec {
 pub const USAGE: &str = "\
 usage: janus check <contract-or-pact>... [options]
        janus check --broker <url> --pacticipant <name> (--version <v> | --branch <name>)
-                   (--environment <name> | --to <tag> | --main-branch) [--as-of <date>] [--json]
+                   (--environment <name> | --to <tag> | --main-branch)
+                   [--on-finding warn|block] [--on-review warn|block] [--as-of <date>] [--json]
 
   <contract-or-pact>...      consumer contracts or v1-v4 pacts, or directories of them
   --provider-shape <path>    a provider shape document, or a directory of them; repeatable
@@ -69,7 +70,9 @@ verification result is reported as unverified, which is not a pass.
 With --broker the documents are the ones `janus publish` put there, and the broker decides:
 its matrix (has each pact been verified?) and, with its Janus module on, this same engine over
 the shape each provider version published. Exit 1 means its answer was no or unknown. The
-broker applies its own policy, so --policy, --on-finding and --on-review do not apply.
+broker applies its own stored policy, so --policy does not apply. --on-finding and --on-review
+are sent as the request's own layer, last: `block` makes the answer stricter, and `warn` cannot
+loosen what the broker's policy blocks.
 Credentials come from PACT_BROKER_TOKEN, or PACT_BROKER_USERNAME and PACT_BROKER_PASSWORD.";
 
 pub fn run(args: &Args) -> ExitCode {
@@ -231,15 +234,9 @@ fn run_against_broker(args: &Args, base: &str) -> ExitCode {
       USAGE,
     );
   }
-  if [
-    "provider-shape",
-    "verification",
-    "policy",
-    "on-finding",
-    "on-review",
-  ]
-  .iter()
-  .any(|option| args.value(option).is_some())
+  if ["provider-shape", "verification", "policy"]
+    .iter()
+    .any(|option| args.value(option).is_some())
   {
     return io::usage(
       "check",
@@ -276,6 +273,16 @@ fn run_against_broker(args: &Args, base: &str) -> ExitCode {
   query.extend(targets);
   if let Some(as_of) = args.value("as-of") {
     query.push(("asOf", as_of.to_string()));
+  }
+  // The per-run layer travels to the broker as it would to a local engine: the broker's engine
+  // puts it after the provider's and the integration's stored layers.
+  for (flag, key) in [("on-finding", "onFinding"), ("on-review", "onReview")] {
+    if let Some(value) = args.value(flag) {
+      if value != "warn" && value != "block" {
+        return io::usage("check", &format!("--{flag} takes 'warn' or 'block'"), USAGE);
+      }
+      query.push((key, value.to_string()));
+    }
   }
   let query: Vec<String> = query
     .iter()

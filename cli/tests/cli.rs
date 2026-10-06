@@ -1013,3 +1013,105 @@ fn component_pull_says_what_to_pin_and_refuses_what_is_not_what_it_claims() {
   let unreachable = janus_cached(&tampered_cache, &["component", "pull", &reference]);
   assert_eq!(code(&unreachable), 2, "{}", stderr(&unreachable));
 }
+
+/// A broker that answers one request with `body`, and hands back the request line it was sent.
+fn one_shot_broker(body: &'static str) -> (String, std::thread::JoinHandle<String>) {
+  use std::io::{BufRead, BufReader, Write};
+  let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("binding a port");
+  let url = format!("http://{}", listener.local_addr().expect("the bound address"));
+  let handle = std::thread::spawn(move || {
+    let (stream, _) = listener.accept().expect("a request");
+    let mut reader = BufReader::new(stream);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).expect("the request line");
+    loop {
+      let mut header = String::new();
+      reader.read_line(&mut header).expect("a header");
+      if header.trim().is_empty() {
+        break;
+      }
+    }
+    let mut stream = reader.into_inner();
+    write!(
+      stream,
+      "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+      body.len()
+    )
+    .expect("the response");
+    request_line
+  });
+  (url, handle)
+}
+
+#[test]
+fn check_against_a_broker_sends_the_per_run_policy_as_query_parameters() {
+  let (url, request) = one_shot_broker(
+    r#"{"answer":"no","decidedBy":"matrix","pacticipant":"order-service","version":{"number":"1.0.0"},"target":{"environment":"production"},"relationships":[]}"#,
+  );
+  let output = janus(&[
+    "check",
+    "--broker",
+    &url,
+    "--pacticipant",
+    "order-service",
+    "--version",
+    "1.0.0",
+    "--environment",
+    "production",
+    "--on-finding",
+    "block",
+    "--on-review",
+    "warn",
+  ]);
+  let request = request.join().expect("the broker thread");
+  assert!(
+    request.starts_with(
+      "GET /decisions?pacticipant=order-service&version=1.0.0&environment=production&onFinding=block&onReview=warn "
+    ),
+    "{request}"
+  );
+  assert_eq!(code(&output), 1, "{}", stdout(&output));
+}
+
+#[test]
+fn check_against_a_broker_still_refuses_local_documents_and_bad_policy_values() {
+  let output = janus(&[
+    "check",
+    "--broker",
+    "http://127.0.0.1:9",
+    "--pacticipant",
+    "a",
+    "--version",
+    "1",
+    "--environment",
+    "e",
+    "--policy",
+    "policy.yaml",
+  ]);
+  assert_eq!(code(&output), 2);
+  assert!(
+    stderr(&output).contains("drop the local options"),
+    "{}",
+    stderr(&output)
+  );
+
+  let output = janus(&[
+    "check",
+    "--broker",
+    "http://127.0.0.1:9",
+    "--pacticipant",
+    "a",
+    "--version",
+    "1",
+    "--environment",
+    "e",
+    "--on-review",
+    "maybe",
+  ]);
+  assert_eq!(code(&output), 2);
+  assert!(
+    stderr(&output).contains("--on-review takes 'warn' or 'block'"),
+    "{}",
+    stderr(&output)
+  );
+}
